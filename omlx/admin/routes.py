@@ -30,15 +30,24 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
 from ..model_discovery import model_display_name as _model_display_name
-from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..model_profiles import (
+    EXCLUDED_FROM_PROFILES,
+    filter_profile_fields,
+    filter_universal_fields,
+)
 from ..model_settings import (
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
+    ModelSettings,
+    resolve_vlm_mtp_conflicts,
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    validate_ane_prefill,
     merge_chat_template_kwargs,
 )
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
@@ -146,6 +155,21 @@ print(deleted)
     return deleted, len(node_ids)
 
 
+def _oq_a8_kernels_available() -> bool:
+    """True when the oQ A8 prefill kernels can actually run on this host.
+
+    Enabling the setting on a machine without tensor units would leave every
+    projection falling back, so the save is refused rather than accepted into
+    a no-op.
+    """
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+
+        return bool(fast.oq_a8_available())
+    except Exception:
+        return False
+
+
 # =============================================================================
 # Pydantic Models
 # =============================================================================
@@ -220,7 +244,10 @@ class ModelSettingsRequest(BaseModel):
     # Keep  thinking blocks in historical turns (None = auto, True when the
     # template supports it). Mirrors ModelSettings.preserve_thinking.
     preserve_thinking: bool | None = None
+    cache_reasoning_output: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
+    deepseek_v41_engram_ssd_offload: bool | None = None
+    deepseek_v41_ced_prefill_enabled: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
@@ -234,6 +261,7 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_sequence_length: int | None = None
     qwen35_ane_prefill_tail_padding_min_tokens: int | None = None
     qwen35_ane_prefill_fraction: float | None = None
+    qwen35_ane_prefill_shared_fraction: float | None = None
     qwen35_ane_prefill_fused_down: bool | None = None
     qwen35_ane_prefill_max_layers: int | None = None
     qwen35_ane_prefill_dual_ane: bool | None = None
@@ -246,6 +274,12 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
+    # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8)
+    qwen35_oq_a8_enabled: bool | None = None
+    qwen35_oq_a8_min_tokens: int | None = None
+    # MoE expert offload (stream non-resident experts from the checkpoint)
+    moe_expert_offload_enabled: bool | None = None
+    moe_expert_offload_resident_fraction: float | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -284,6 +318,72 @@ class ModelSettingsRequest(BaseModel):
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
 
+    @field_validator("turboquant_kv_bits")
+    @classmethod
+    def validate_turboquant_bits(cls, value: float | None) -> float | None:
+        if value is None or value == 0:
+            return 4 if value == 0 else None
+        if value not in (2, 2.5, 3, 3.5, 4, 6, 8):
+            raise ValueError("turboquant_kv_bits must be 2, 2.5, 3, 3.5, 4, 6, or 8")
+        return value
+
+    @field_validator("dflash_verify_mode")
+    @classmethod
+    def validate_dflash_verify_mode(cls, value: str | None) -> str | None:
+        if value not in (None, "", "dflash", "adaptive", "ddtree", "off"):
+            raise ValueError(
+                "dflash_verify_mode must be dflash, adaptive, ddtree, or off"
+            )
+        return value or None
+
+    @field_validator("dflash_in_memory_cache_max_entries")
+    @classmethod
+    def validate_dflash_cache_entries(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("dflash_in_memory_cache_max_entries must be non-negative")
+        return 4 if value == 0 else value
+
+    @field_validator("reasoning_parser")
+    @classmethod
+    def validate_reasoning_parser(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        parsers = _grammar_parser_options()
+        if parsers is None:
+            logger.warning(
+                "Cannot validate reasoning_parser %r: xgrammar unavailable", value
+            )
+        elif value not in {parser["value"] for parser in parsers}:
+            raise ValueError(f"Unknown reasoning_parser: {value}")
+        return value
+
+    @field_validator(
+        "specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model"
+    )
+    @classmethod
+    def validate_draft_path(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        path = Path(value).expanduser()
+        # Match local references without resolving or downloading HF repo IDs.
+        if (
+            path.is_absolute() or value.startswith(("./", "../")) or path.exists()
+        ) and not (path / "config.json").is_file():
+            raise ValueError(f"Draft model has no config.json: {value}")
+        return value
+
+
+def _normalize_profile_settings(
+    value: dict[str, Any] | None, *, universal: bool = False
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    filtered = (filter_universal_fields if universal else filter_profile_fields)(value)
+    # Reuse the settings API's types and validators, preserving absent fields.
+    return ModelSettingsRequest.model_validate(filtered).model_dump(
+        exclude_unset=True, exclude_none=True
+    )
+
 
 class CreateProfileRequest(BaseModel):
     """Request body for creating a per-model profile."""
@@ -296,6 +396,11 @@ class CreateProfileRequest(BaseModel):
     also_save_as_template: bool = False
     source_template: str | None = None
     expose_as_model: bool = False
+
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value)
 
 
 class UpdateProfileRequest(BaseModel):
@@ -310,6 +415,11 @@ class UpdateProfileRequest(BaseModel):
     expose_as_model: bool | None = None
     also_save_as_template: bool = False
 
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value)
+
 
 class CreateTemplateRequest(BaseModel):
     """Request body for creating a global template."""
@@ -319,6 +429,11 @@ class CreateTemplateRequest(BaseModel):
     description: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value, universal=True)
+
 
 class UpdateTemplateRequest(BaseModel):
     """Request body for updating/renaming a global template."""
@@ -327,6 +442,63 @@ class UpdateTemplateRequest(BaseModel):
     display_name: str | None = None
     description: str | None = None
     settings: dict[str, Any] | None = None
+
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings(cls, value):
+        return _normalize_profile_settings(value, universal=True)
+
+
+# Dashboard layout grid contract. Keep in sync with static/js/dashboard_layout.js.
+DASHBOARD_COLUMNS = 24
+DASHBOARD_BLOCK_MIN_W = 6
+DASHBOARD_BLOCK_IDS = (
+    "serving_stats",
+    "usage_history",
+    "active_models",
+    "cache_observability",
+    "api_endpoints",
+    "claude_code",
+    "applications",
+    "engine_versions",
+)
+
+
+class DashboardLayoutBlock(BaseModel):
+    """One placed dashboard block in grid units."""
+
+    id: str
+    x: int = Field(ge=0, lt=DASHBOARD_COLUMNS)
+    y: int = Field(ge=0)
+    w: int = Field(ge=DASHBOARD_BLOCK_MIN_W, le=DASHBOARD_COLUMNS)
+
+    @model_validator(mode="after")
+    def _fits_grid(self):
+        if self.x + self.w > DASHBOARD_COLUMNS:
+            raise ValueError(f"block {self.id!r} exceeds {DASHBOARD_COLUMNS} columns")
+        return self
+
+
+class DashboardLayoutRequest(BaseModel):
+    """Saved dashboard block layout."""
+
+    version: Literal[1] = 1
+    width: Literal["default", "wide", "wider", "full"] = "default"
+    blocks: list[DashboardLayoutBlock] = Field(default_factory=list)
+
+    @field_validator("blocks")
+    @classmethod
+    def _known_unique_blocks(cls, blocks):
+        # Unknown ids are dropped for forward compatibility; duplicates keep
+        # the first occurrence.
+        seen: set[str] = set()
+        kept = []
+        for block in blocks:
+            if block.id not in DASHBOARD_BLOCK_IDS or block.id in seen:
+                continue
+            seen.add(block.id)
+            kept.append(block)
+        return kept
 
 
 class GlobalSettingsRequest(BaseModel):
@@ -384,6 +556,9 @@ class GlobalSettingsRequest(BaseModel):
     mcp_config: str | None = None
     mcp_expose_tools: bool | None = None
 
+    # Usage history settings
+    usage_history: bool | None = None
+
     # HuggingFace settings
     hf_endpoint: str | None = None
     hf_cache_enabled: bool | None = None
@@ -438,6 +613,8 @@ class GlobalSettingsRequest(BaseModel):
 
     # UI settings
     ui_language: str | None = None
+    # Explicit null restores the default dashboard layout.
+    ui_dashboard_layout: DashboardLayoutRequest | None = None
 
     # Idle timeout settings. null/0/"" disables the global fallback.
     idle_timeout_seconds: int | None = Field(default=None, ge=60)
@@ -657,6 +834,8 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["turboquant_kv_enabled"] = False
     settings["turboquant_kv_bits"] = 4
     settings["turboquant_skip_last"] = True
+    settings["moe_expert_offload_enabled"] = False
+    settings["moe_expert_offload_resident_fraction"] = 0.25
     settings["specprefill_enabled"] = False
     settings["dflash_enabled"] = False
     settings["dflash_in_memory_cache"] = True
@@ -732,6 +911,8 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.turboquant_kv_enabled = False
     settings.turboquant_kv_bits = 4
     settings.turboquant_skip_last = True
+    settings.moe_expert_offload_enabled = False
+    settings.moe_expert_offload_resident_fraction = 0.25
     settings.specprefill_enabled = False
     settings.specprefill_draft_model = None
     settings.specprefill_keep_pct = None
@@ -1378,6 +1559,18 @@ def set_hf_uploader(uploader):
 # =============================================================================
 
 
+def _active_bind_host(global_settings) -> str:
+    """Return the bind address in use until the next server restart."""
+
+    server_state = _get_server_state() if _get_server_state is not None else None
+    active_host = (
+        getattr(server_state, "bind_host", None)
+        if getattr(server_state, "global_settings", None) is global_settings
+        else None
+    )
+    return active_host or global_settings.server.host
+
+
 def format_size(size_bytes: int) -> str:
     """
     Format a byte size as a human-readable string.
@@ -1536,9 +1729,12 @@ async def login_page(request: Request):
 
     global_settings = _get_global_settings()
 
-    # Skip login page when skip_api_key_verification is enabled
+    # Skip login only when no-auth mode is confined to loopback.
     if global_settings is not None and global_settings.auth.skip_api_key_verification:
-        return RedirectResponse(url="/admin/dashboard", status_code=302)
+        from ..utils.network import is_loopback_bind
+
+        if is_loopback_bind(_active_bind_host(global_settings)):
+            return RedirectResponse(url="/admin/dashboard", status_code=302)
 
     api_key_configured = bool(global_settings and global_settings.auth.api_key)
     return templates.TemplateResponse(
@@ -1656,7 +1852,11 @@ async def login(request: LoginRequest, response: Response):
 
 
 @router.post("/api/setup-api-key")
-async def setup_api_key(request: SetupApiKeyRequest, response: Response):
+async def setup_api_key(
+    request: SetupApiKeyRequest,
+    response: Response,
+    http_request: Request,
+):
     """
     Set up the initial API key when none is configured.
 
@@ -1667,6 +1867,7 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
     Args:
         request: SetupApiKeyRequest with api_key and api_key_confirm.
         response: FastAPI response object for setting cookies.
+        http_request: Incoming request used to verify the peer address.
 
     Returns:
         JSON response with success status.
@@ -1678,6 +1879,20 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
     from ..server import _server_state
 
     global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    from ..utils.network import is_loopback_bind, is_loopback_bind_host
+
+    peer_host = getattr(getattr(http_request, "client", None), "host", None)
+    if (
+        not is_loopback_bind(_active_bind_host(global_settings))
+        or not is_loopback_bind_host(peer_host)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Initial API key setup is only available over loopback.",
+        )
 
     # Only allow setup if no API key is currently configured
     if global_settings and global_settings.auth.api_key:
@@ -1894,8 +2109,7 @@ def _models_from_docstring(fn) -> list[str]:
     ]
 
 
-@router.get("/api/grammar/parsers")
-async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+def _grammar_parser_options() -> list[dict] | None:
     """Return available reasoning parser names from xgrammar.
 
     Supports both API generations:
@@ -1906,7 +2120,7 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     - **xgrammar 0.1.32–0.1.33** exposes the now-removed helper
       ``get_builtin_structural_tag_supported_models()``.
 
-    Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
+    Returns ``None`` if xgrammar is missing, fails to load (e.g. broken native
     binding on macOS arm64), or has neither API available.
     """
     # Install the torch stub BEFORE any xgrammar import. If this lives
@@ -1943,12 +2157,44 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
         ]
     except Exception as e:
         logger.warning("xgrammar parser discovery unavailable: %s", e)
-        return []
+        return None
+
+
+@router.get("/api/grammar/parsers")
+async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+    return _grammar_parser_options() or []
 
 
 # =============================================================================
 # Models API Routes
 # =============================================================================
+
+
+def _model_options(model_info: dict, settings) -> dict:
+    """Describe model controls once for the web and native settings clients."""
+    from ..patches.k2_horizon import REASONING_EFFORTS
+
+    model_type = (model_info.get("config_model_type") or "").lower().replace("-", "_")
+    is_k2 = model_type == "k2_horizon"
+    thinking_modes = ["auto", "on_limit"] if is_k2 else [
+        "auto", "on_unlimit", "on_limit", "off"
+    ]
+    ane_backend = (
+        None if model_info.get("is_helper") else ane_prefill_backend(model_type)
+    )
+    return {
+        "thinking_forced": is_k2,
+        "thinking_modes": thinking_modes,
+        "reasoning_effort_options": list(REASONING_EFFORTS) if is_k2 else [
+            "low", "medium", "high", "xhigh", "max"
+        ],
+        "reasoning_effort_default": "high" if is_k2 else "low",
+        "reasoning_effort_custom": not is_k2,
+        "ane_prefill_backend": ane_backend,
+        "ane_prefill_default_fraction": ane_prefill_fraction(None, model_type),
+        "ane_prefill_mlp_fractions": [1 / 3, 0.5] if ane_backend == "k2" else [],
+        "ane_prefill_shared_fractions": [0, 1 / 3, 1] if ane_backend == "k2" else [],
+    }
 
 
 def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
@@ -2030,6 +2276,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        from ..patches.moe_offload_compat import moe_offload_compatibility
+
+        moe_offload_supported, _ = moe_offload_compatibility(
+            model_info.get("model_path") or ""
+        )
         qwen4_ple_ssd_offload_supported = False
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
@@ -2045,6 +2296,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 estimate = qwen4_exp_residency_estimate(
                     model_info.get("model_path", "")
                 )
+                if getattr(settings, "moe_expert_offload_enabled", False):
+                    entry = engine_pool.get_entry(model_id)
+                    if entry is not None:
+                        _, _, adjusted = engine_pool._qwen4_ple_offload_status(
+                            entry, settings, ceiling=residency_ceiling
+                        )
+                        if adjusted is not None:
+                            estimate = adjusted
                 qwen4_ple_ssd_offload_supported = estimate.supported
                 qwen4_ple_ssd_offload_forced = estimate.force_ssd_offload(
                     residency_ceiling
@@ -2054,6 +2313,42 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             except (OSError, TypeError, ValueError):
                 logger.debug(
                     "Could not inspect Qwen4-Exp PLE residency for %s",
+                    model_id,
+                    exc_info=True,
+                )
+
+        deepseek_v41_engram_ssd_offload_supported = False
+        deepseek_v41_engram_ssd_offload_forced = False
+        v41_resident_bytes = 0
+        v41_mmap_bytes = 0
+        if (model_info.get("config_model_type") or "").replace(
+            "-", "_"
+        ).lower() == "deepseek_v41":
+            try:
+                from ..patches.deepseek_v41.residency import (
+                    deepseek_v41_residency_estimate,
+                )
+
+                estimate = deepseek_v41_residency_estimate(
+                    model_info.get("model_path", "")
+                )
+                if getattr(settings, "moe_expert_offload_enabled", False):
+                    entry = engine_pool.get_entry(model_id)
+                    if entry is not None:
+                        _, _, adjusted = engine_pool._deepseek_v41_engram_offload_status(
+                            entry, settings, ceiling=residency_ceiling
+                        )
+                        if adjusted is not None:
+                            estimate = adjusted
+                deepseek_v41_engram_ssd_offload_supported = estimate.supported
+                deepseek_v41_engram_ssd_offload_forced = estimate.force_ssd_offload(
+                    residency_ceiling
+                )
+                v41_resident_bytes = estimate.resident_bytes
+                v41_mmap_bytes = estimate.mmap_bytes
+            except (KeyError, OSError, TypeError, ValueError):
+                logger.debug(
+                    "Could not inspect DeepSeek V4.1 Engram residency for %s",
                     model_id,
                     exc_info=True,
                 )
@@ -2101,19 +2396,28 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "source_type": model_info.get("source_type", "local"),
             "source_repo_id": model_info.get("source_repo_id"),
+            "distributed": model_info.get("distributed", False),
+            "cluster": model_info.get("cluster"),
             "last_access": model_info.get("last_access"),
             "dflash_compatible": compat_ok,
             "dflash_compatibility_reason": compat_reason,
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
+            "moe_expert_offload_supported": moe_offload_supported,
             "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
+            "deepseek_v41_engram_ssd_offload_supported": deepseek_v41_engram_ssd_offload_supported,
+            "deepseek_v41_engram_ssd_offload_forced": deepseek_v41_engram_ssd_offload_forced,
+            "deepseek_v41_engram_resident_bytes": v41_resident_bytes,
+            "deepseek_v41_engram_mmap_bytes": v41_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
+
+        model_data.update(_model_options(model_data, settings))
 
         # Add settings if available
         if settings:
@@ -2203,9 +2507,12 @@ async def _require_admin_or_bearer(request: Request) -> bool:
     """Allow admin session OR a valid Bearer API key (for CLI use)."""
     gs = _get_global_settings() if _get_global_settings else None
 
-    # No-auth mode: always allow
+    # No-auth mode is restricted to loopback-only binds.
     if gs is not None and gs.auth.skip_api_key_verification:
-        return True
+        from ..utils.network import is_loopback_bind
+
+        if is_loopback_bind(_active_bind_host(gs)):
+            return True
 
     # Valid admin session cookie
     if verify_session(request):
@@ -2435,12 +2742,24 @@ async def update_model_settings(
         )
     if "enable_thinking" in sent:
         current_settings.enable_thinking = request.enable_thinking
+    if "deepseek_v41_ced_prefill_enabled" in sent:
+        is_v41 = (entry.config_model_type or "").replace("-", "_").lower() == "deepseek_v41"
+        current_settings.deepseek_v41_ced_prefill_enabled = bool(
+            request.deepseek_v41_ced_prefill_enabled and is_v41
+        )
     if "qwen4_ple_ssd_offload" in sent:
         is_qwen4_exp = (entry.config_model_type or "").replace(
             "-", "_"
         ).lower() == "qwen4_exp"
         current_settings.qwen4_ple_ssd_offload = bool(
             request.qwen4_ple_ssd_offload and is_qwen4_exp
+        )
+    if "deepseek_v41_engram_ssd_offload" in sent:
+        is_deepseek_v41 = (entry.config_model_type or "").replace(
+            "-", "_"
+        ).lower() == "deepseek_v41"
+        current_settings.deepseek_v41_engram_ssd_offload = bool(
+            request.deepseek_v41_engram_ssd_offload and is_deepseek_v41
         )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
@@ -2490,29 +2809,19 @@ async def update_model_settings(
             True if request.turboquant_skip_last is None
             else bool(request.turboquant_skip_last)
         )
-    # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
-    # controls; the runtime signature below causes a loaded model to be
-    # re-created when the user applies a changed profile.
+    # Shared load-time ANE controls. Model metadata selects limits and backend.
+    ane_backend = ane_prefill_backend(entry.config_model_type)
     if "qwen35_ane_prefill_enabled" in sent:
-        enabled = bool(request.qwen35_ane_prefill_enabled)
-        config_type = str(getattr(entry, "config_model_type", "") or "")
-        config_type = config_type.lower().replace("-", "_")
-        if enabled and not config_type.startswith(
-            ("qwen3_5", "qwen3_6", "qwen3_8")
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="ANE prefill is available only for Qwen3.5/3.6/3.8 models.",
-            )
-        current_settings.qwen35_ane_prefill_enabled = enabled
+        current_settings.qwen35_ane_prefill_enabled = bool(
+            request.qwen35_ane_prefill_enabled
+        )
     if "qwen35_ane_prefill_sequence_length" in sent:
         value = request.qwen35_ane_prefill_sequence_length
-        if value is None or value < 1024 or value % 64:
+        if value is None:
             raise HTTPException(
-                status_code=400,
-                detail="ANE prompt block must be a multiple of 64 and at least 1024.",
+                status_code=400, detail="ANE prompt block cannot be null."
             )
-        current_settings.qwen35_ane_prefill_sequence_length = int(value)
+        current_settings.qwen35_ane_prefill_sequence_length = value
         if (
             current_settings.qwen35_ane_prefill_tail_padding_min_tokens
             >= int(value)
@@ -2533,13 +2842,14 @@ async def update_model_settings(
             )
         current_settings.qwen35_ane_prefill_tail_padding_min_tokens = int(value)
     if "qwen35_ane_prefill_fraction" in sent:
-        value = request.qwen35_ane_prefill_fraction
-        if value is None or not 0.05 <= value <= 0.90:
-            raise HTTPException(
-                status_code=400,
-                detail="MLP ANE fraction must be between 0.05 and 0.90.",
-            )
-        current_settings.qwen35_ane_prefill_fraction = float(value)
+        current_settings.qwen35_ane_prefill_fraction = (
+            request.qwen35_ane_prefill_fraction
+        )
+    if "qwen35_ane_prefill_shared_fraction" in sent:
+        value = request.qwen35_ane_prefill_shared_fraction
+        current_settings.qwen35_ane_prefill_shared_fraction = (
+            1.0 if value is None else value
+        )
     if "qwen35_ane_prefill_max_layers" in sent:
         value = request.qwen35_ane_prefill_max_layers
         if value is None or value < 1:
@@ -2613,9 +2923,25 @@ async def update_model_settings(
         current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
             request.qwen35_ane_prefill_cpu_shared_resource
         )
+    # oQ mixed-bit QxA8 prefill. Load-time like the ANE controls above: the
+    # runtime signature re-creates a loaded model when this changes.
+    if "qwen35_oq_a8_enabled" in sent:
+        current_settings.qwen35_oq_a8_enabled = bool(request.qwen35_oq_a8_enabled)
+    if "qwen35_oq_a8_min_tokens" in sent:
+        value = request.qwen35_oq_a8_min_tokens
+        if value is None or value < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="oQ A8 min tokens must be at least 1.",
+            )
+        current_settings.qwen35_oq_a8_min_tokens = int(value)
     if (
-        current_settings.qwen35_ane_prefill_fused_down
-        and current_settings.qwen35_ane_prefill_fraction > 0.50
+        ane_backend == "qwen"
+        and current_settings.qwen35_ane_prefill_fused_down
+        and ane_prefill_fraction(
+            current_settings.qwen35_ane_prefill_fraction, entry.config_model_type
+        )
+        > 0.50
     ):
         # The fused loader reuses the MLP fraction for the down projection and
         # rejects anything above 0.50 at enable time. Without this check the
@@ -2628,8 +2954,11 @@ async def update_model_settings(
             ),
         )
     if (
-        current_settings.qwen35_ane_prefill_cpu_enabled
-        and current_settings.qwen35_ane_prefill_fraction
+        ane_backend == "qwen"
+        and current_settings.qwen35_ane_prefill_cpu_enabled
+        and ane_prefill_fraction(
+            current_settings.qwen35_ane_prefill_fraction, entry.config_model_type
+        )
         * (2 if current_settings.qwen35_ane_prefill_fused_down else 1)
         + current_settings.qwen35_ane_prefill_cpu_fraction
         >= 1.0
@@ -2643,7 +2972,8 @@ async def update_model_settings(
             ),
         )
     if (
-        current_settings.qwen35_ane_prefill_cpu_enabled
+        ane_backend == "qwen"
+        and current_settings.qwen35_ane_prefill_cpu_enabled
         and current_settings.qwen35_ane_prefill_gdn
         and current_settings.qwen35_ane_prefill_gdn_fraction
         + current_settings.qwen35_ane_prefill_cpu_gdn_fraction
@@ -2652,6 +2982,17 @@ async def update_model_settings(
         raise HTTPException(
             status_code=400,
             detail="GDN ANE and CPU fractions must total less than 1.0.",
+        )
+    # MoE expert offload settings
+    if "moe_expert_offload_enabled" in sent:
+        current_settings.moe_expert_offload_enabled = (
+            request.moe_expert_offload_enabled or False
+        )
+    if "moe_expert_offload_resident_fraction" in sent:
+        current_settings.moe_expert_offload_resident_fraction = (
+            0.25
+            if request.moe_expert_offload_resident_fraction is None
+            else request.moe_expert_offload_resident_fraction
         )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
@@ -2771,12 +3112,7 @@ async def update_model_settings(
             int(value) if value is not None and value > 0 else None
         )
     if "dflash_verify_mode" in sent:
-        value = request.dflash_verify_mode
-        # dflash-mlx accepts: dflash | adaptive | ddtree | off.
-        # Anything else (including empty string) → revert to dflash default.
-        current_settings.dflash_verify_mode = (
-            value if value in ("dflash", "adaptive", "ddtree", "off") else None
-        )
+        current_settings.dflash_verify_mode = request.dflash_verify_mode
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -2905,6 +3241,8 @@ async def update_model_settings(
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
 
+    if "cache_reasoning_output" in sent:
+        current_settings.cache_reasoning_output = request.cache_reasoning_output
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
     if "guided_grammar_enabled" in sent:
@@ -2914,6 +3252,7 @@ async def update_model_settings(
     if "guided_grammar" in sent:
         grammar = request.guided_grammar.strip() if request.guided_grammar else None
         current_settings.guided_grammar = grammar or None
+    _validate_model_settings(entry, current_settings.to_dict())
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
@@ -3157,6 +3496,72 @@ def _raise_if_alias_conflicts_exposed_profiles(
             )
 
 
+def _validate_model_settings(entry, settings):
+    from ..model_settings import validate_moe_expert_offload
+
+    try:
+        validate_moe_expert_offload(settings)
+        if settings.get("moe_expert_offload_enabled"):
+            from ..patches.moe_offload_compat import moe_offload_compatibility
+
+            supported, reason = moe_offload_compatibility(entry.model_path)
+            if not supported:
+                raise ValueError(reason)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    if "qwen35_oq_a8_min_tokens" in settings:
+        value = settings["qwen35_oq_a8_min_tokens"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise HTTPException(
+                status_code=400, detail="oQ A8 min tokens must be at least 1."
+            )
+    if settings.get("qwen35_oq_a8_enabled"):
+        config_type = str(getattr(entry, "config_model_type", "") or "")
+        config_type = config_type.lower().replace("-", "_")
+        if not config_type.startswith(("qwen3_5", "qwen3_6", "qwen3_8")):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 models."
+                ),
+            )
+        if not _oq_a8_kernels_available():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "oQ A8 prefill needs the native Qwen3.5 prefill kernels and "
+                    "a Metal device with native INT8 tensor operations "
+                    "(M5-series or newer)."
+                ),
+            )
+        if settings.get("qwen35_ane_prefill_enabled"):
+            raise HTTPException(
+                status_code=400,
+                detail="ANE prefill and oQ A8 prefill cannot both be enabled.",
+            )
+    if any(key.startswith("qwen35_ane_prefill_") for key in settings):
+        try:
+            validate_ane_prefill(settings, entry.config_model_type)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+    if entry.config_model_type == "k2_horizon":
+        from ..patches.k2_horizon import validate_chat_template_kwargs
+
+        kwargs = dict(settings.get("chat_template_kwargs") or {})
+        if settings.get("enable_thinking") is not None:
+            kwargs["enable_thinking"] = settings["enable_thinking"]
+        validate_chat_template_kwargs(kwargs)
+
+    if not _entry_is_diffusion_model(entry):
+        # Use the same conflict rules and output-setting precedence as profile apply.
+        resolved, _ = resolve_vlm_mtp_conflicts(settings)
+        try:
+            ModelSettings.from_dict(resolved)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @router.get("/api/models/{model_id}/profiles")
 async def list_model_profiles(
     model_id: str,
@@ -3173,10 +3578,11 @@ async def create_model_profile(
     request: CreateProfileRequest,
     is_admin: bool = Depends(require_admin),
 ):
-    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+    from ..model_profiles import InvalidProfileNameError
 
     mgr = _require_settings_manager()
-    _require_model(model_id)
+    entry = _require_model(model_id)
+    _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
         profile = mgr.save_profile(
@@ -3217,10 +3623,11 @@ async def update_model_profile(
     request: UpdateProfileRequest,
     is_admin: bool = Depends(require_admin),
 ):
-    from ..model_profiles import InvalidProfileNameError, filter_universal_fields
+    from ..model_profiles import InvalidProfileNameError
 
     mgr = _require_settings_manager()
-    _require_model(model_id)
+    entry = _require_model(model_id)
+    _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
         updated = mgr.update_profile(
@@ -3279,7 +3686,11 @@ async def apply_model_profile(
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
     is_diffusion_model = _entry_is_diffusion_model(entry)
-    sanitizer = _sanitize_diffusion_settings_dict if is_diffusion_model else None
+    def sanitizer(settings):
+        if is_diffusion_model:
+            _sanitize_diffusion_settings_dict(settings)
+        _validate_model_settings(entry, settings)
+
     try:
         applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
     except ValueError as e:
@@ -3289,6 +3700,29 @@ async def apply_model_profile(
     if is_diffusion_model:
         _sanitize_diffusion_model_settings(applied)
         mgr.set_settings(model_id, applied)
+    return {"model_id": model_id, "settings": applied.to_dict()}
+
+
+@router.post("/api/models/{model_id}/profile-templates/{name}/apply")
+async def apply_model_template(
+    model_id: str,
+    name: str,
+    is_admin: bool = Depends(require_admin),
+):
+    mgr = _require_settings_manager()
+    entry = _require_model(model_id)
+
+    def sanitizer(settings):
+        if _entry_is_diffusion_model(entry):
+            _sanitize_diffusion_settings_dict(settings)
+        _validate_model_settings(entry, settings)
+
+    try:
+        applied = mgr.apply_template(model_id, name, settings_sanitizer=sanitizer)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if applied is None:
+        raise HTTPException(status_code=404, detail=f"Template not found: {name}")
     return {"model_id": model_id, "settings": applied.to_dict()}
 
 
@@ -3710,6 +4144,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "config_path": global_settings.mcp.config_path,
             "expose_tools": global_settings.mcp.expose_tools,
         },
+        "usage": {
+            "usage_history": global_settings.usage.usage_history,
+        },
         "huggingface": {
             "endpoint": global_settings.huggingface.endpoint,
             "hf_cache_enabled": global_settings.huggingface.hf_cache_enabled,
@@ -3787,6 +4224,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "ui": {
             "language": global_settings.ui.language,
+            "dashboard_layout": global_settings.ui.dashboard_layout,
         },
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
@@ -3821,6 +4259,60 @@ async def update_global_settings(
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
+    from ..utils.network import (
+        is_loopback_bind,
+        is_valid_bind_host,
+        network_auth_error,
+    )
+
+    candidate_host = (
+        request.host
+        if request.host is not None
+        else getattr(global_settings.server, "host", "127.0.0.1")
+    )
+    host_parts = [host.strip() for host in candidate_host.split(",") if host.strip()]
+    if not host_parts:
+        raise HTTPException(status_code=400, detail="Host cannot be empty")
+    for host in host_parts:
+        if not is_valid_bind_host(host):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid host: {host!r} (must be a hostname or IP address)",
+            )
+
+    if request.api_key is not None:
+        is_valid, error_msg = validate_api_key(request.api_key)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+    candidate_api_key = (
+        request.api_key
+        if request.api_key is not None
+        else global_settings.auth.api_key
+    )
+    candidate_skip_verification = (
+        request.skip_api_key_verification
+        if request.skip_api_key_verification is not None
+        else global_settings.auth.skip_api_key_verification
+    )
+    if auth_error := network_auth_error(
+        candidate_host,
+        candidate_api_key,
+        candidate_skip_verification,
+    ):
+        raise HTTPException(status_code=400, detail=auth_error)
+    if (
+        request.skip_api_key_verification is True
+        and not is_loopback_bind(_active_bind_host(global_settings))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "API key verification cannot be skipped while the running server "
+                "is bound to a non-loopback host. Save a loopback host and restart "
+                "the server first."
+            ),
+        )
+
     # Track which settings were applied at runtime
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
@@ -3828,17 +4320,6 @@ async def update_global_settings(
 
     # Apply server settings
     if request.host is not None:
-        from ..utils.network import is_valid_bind_host
-
-        parts = [h.strip() for h in request.host.split(",") if h.strip()]
-        if not parts:
-            raise HTTPException(status_code=400, detail="Host cannot be empty")
-        for part in parts:
-            if not is_valid_bind_host(part):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid host: {part!r} (must be a hostname or IP address)",
-                )
         global_settings.server.host = request.host
     if request.port is not None:
         global_settings.server.port = request.port
@@ -4308,6 +4789,18 @@ async def update_global_settings(
         global_settings.mcp.expose_tools = request.mcp_expose_tools
         runtime_applied.append("mcp_expose_tools")
 
+    # Usage history recording is applied at runtime (no restart needed).
+    # Disabling flushes pending aggregates and leaves usage.sqlite3 in place.
+    if request.usage_history is not None:
+        global_settings.usage.usage_history = request.usage_history
+        from ..server_metrics import get_server_metrics
+
+        history = get_server_metrics().usage_history
+        if history is not None:
+            # Disabling flushes to SQLite; keep that off the event loop.
+            await asyncio.to_thread(history.set_enabled, request.usage_history)
+        runtime_applied.append("usage_history")
+
     # Apply HuggingFace settings (Live - immediately applied via env var)
     if request.hf_endpoint is not None:
         global_settings.huggingface.endpoint = request.hf_endpoint
@@ -4648,6 +5141,13 @@ async def update_global_settings(
         _refresh_i18n_globals()
         logger.info(f"UI language changed to: {request.ui_language}")
 
+    if "ui_dashboard_layout" in request.model_fields_set:
+        layout = request.ui_dashboard_layout
+        global_settings.ui.dashboard_layout = (
+            layout.model_dump() if layout is not None else None
+        )
+        runtime_applied.append("ui_dashboard_layout")
+
     # Apply idle timeout settings (Live)
     # Use model_fields_set to distinguish "explicitly sent as null" (disable)
     # from "not sent" (don't touch).
@@ -4662,10 +5162,6 @@ async def update_global_settings(
     # Apply auth settings (API key change)
     if request.api_key is not None:
         from ..server import _server_state
-
-        is_valid, error_msg = validate_api_key(request.api_key)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=error_msg)
 
         global_settings.auth.api_key = request.api_key
         _server_state.api_key = request.api_key
@@ -5005,6 +5501,44 @@ def _parse_commits_from_pyproject(pyproject_path, packages: dict[str, str]) -> d
     return commits
 
 
+def _distributed_runtime_cache_stats(engine) -> dict | None:
+    """Rank zero's telemetry cache counters as a runtime-cache row source.
+
+    Distributed engines own no local scheduler, so the paged hot/SSD stats do
+    not exist for them. What rank zero reports is its per-rank prompt cache
+    (in-memory LRU) and prompt-snapshot store — returned here under a
+    separate ``rank_prompt_cache`` key so callers never confuse it with the
+    tiered hot/SSD cache columns or aggregates.
+    """
+
+    get_live = getattr(engine, "get_live_metrics", None)
+    if not callable(get_live):
+        return None
+    try:
+        live = get_live()
+    except Exception:  # noqa: BLE001
+        logger.debug("cluster live metrics failed", exc_info=True)
+        return None
+    if live is None or live.get("stale"):
+        return None
+    metrics = live.get("metrics")
+    cache = metrics.get("cache") if isinstance(metrics, dict) else None
+    if not isinstance(cache, dict):
+        return None
+    return {
+        "rank_prompt_cache": {
+            "entries": int(cache.get("entries", 0) or 0),
+            "bytes": int(cache.get("bytes", 0) or 0),
+            "lookups": int(cache.get("lookups", 0) or 0),
+            "hits": int(cache.get("hits", 0) or 0),
+            "misses": int(cache.get("misses", 0) or 0),
+            "hit_rate": float(cache.get("hit_rate", 0.0) or 0.0),
+            "tokens_reused": int(cache.get("tokens_reused", 0) or 0),
+            "affinity": str(cache.get("affinity", "none")),
+        },
+    }
+
+
 def _build_runtime_cache_observability(
     global_settings,
     model_filter: str = "",
@@ -5098,6 +5632,12 @@ def _build_runtime_cache_observability(
                     exc,
                 )
                 continue
+
+        if not runtime_stats and model_info.get("cluster"):
+            # Distributed engines own no local scheduler; fall back to rank
+            # zero's telemetry cache counters (kept out of the tiered hot/SSD
+            # columns and aggregates — see _distributed_runtime_cache_stats).
+            runtime_stats = _distributed_runtime_cache_stats(entry.engine)
 
         if not runtime_stats:
             continue
@@ -5261,6 +5801,15 @@ def _build_runtime_cache_observability(
         if cache_rates:
             model_payload["cache_rates"] = cache_rates
 
+        rank_prompt_cache = runtime_stats.get("rank_prompt_cache")
+        if isinstance(rank_prompt_cache, dict):
+            # Label the row so the UI presents these as rank-local prompt
+            # cache/snapshot stats, never as the tiered hot/SSD cache. Every
+            # tiered numeric field above stays 0, so the hot-cache and SSD
+            # aggregates are unaffected.
+            model_payload["cache_tier"] = "rank-prompt-snapshot"
+            model_payload["rank_prompt_cache"] = rank_prompt_cache
+
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
         payload["total_size_bytes"] += model_payload["total_size_bytes"]
@@ -5296,19 +5845,40 @@ def _build_runtime_cache_observability(
         try:
             num_files = 0
             total_bytes = 0
-            for subdir in "0123456789abcdef":
-                subdir_path = cache_dir / subdir
-                if not subdir_path.exists():
-                    continue
-                for f in subdir_path.glob("*.safetensors"):
-                    num_files += 1
-                    total_bytes += f.stat().st_size
+            for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
+                for subdir in "0123456789abcdef":
+                    subdir_path = root / subdir
+                    if not subdir_path.exists():
+                        continue
+                    for f in subdir_path.glob("*.safetensors"):
+                        num_files += 1
+                        total_bytes += f.stat().st_size
             payload["total_num_files"] = num_files
             payload["total_size_bytes"] = total_bytes
         except Exception as exc:
             logger.warning("Failed to scan SSD cache directory: %s", exc)
 
     return payload
+
+
+@router.get("/api/usage")
+def get_usage_history(
+    range: Literal["today", "yesterday", "7d", "30d", "90d", "month"] = "today",
+    model: str = "",
+    include_details: bool = False,
+    is_admin: bool = Depends(require_admin),
+):
+    """Local hourly serving history. Sync route keeps SQLite off the event loop."""
+    from ..server_metrics import get_server_metrics
+
+    history = get_server_metrics().usage_history
+    if history is None:
+        raise HTTPException(status_code=503, detail="Usage history unavailable")
+    try:
+        # Exact canonical IDs allow filtering historical models no longer loaded.
+        return history.query(range, model, include_details=include_details)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Usage history unavailable") from exc
 
 
 @router.get("/api/stats")
@@ -5469,6 +6039,28 @@ def _build_active_models_data() -> dict:
                 activity_requests = snapshot.get("active_requests", 0)
                 activities = snapshot.get("activities", [])
 
+        # Cluster (distributed) engines own no local scheduler or collectors;
+        # their live stats come from rank zero's telemetry marker instead.
+        cluster_live = None
+        if (
+            model_info.get("cluster")
+            and entry is not None
+            and entry.engine is not None
+        ):
+            get_live = getattr(entry.engine, "get_live_metrics", None)
+            if callable(get_live):
+                try:
+                    cluster_live = get_live()
+                except Exception:  # noqa: BLE001
+                    logger.debug("cluster live metrics failed", exc_info=True)
+        # A stale marker proves nothing about the ranks' current state; show
+        # the model as idle rather than repeating outdated rates.
+        cluster_metrics = (
+            cluster_live["metrics"]
+            if cluster_live is not None and not cluster_live.get("stale")
+            else None
+        )
+
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
         if has_scheduler_snapshot:
@@ -5478,6 +6070,10 @@ def _build_active_models_data() -> dict:
         if has_scheduler_snapshot or collector_request_ids:
             active_requests = len(active_request_ids)
         active_requests += activity_requests
+        if cluster_metrics is not None:
+            # Rank zero's count is the only live source for distributed rows.
+            rank_active = cluster_metrics.get("active_requests", 0)
+            active_requests = int(rank_active) if isinstance(rank_active, int) else 0
 
         # Generating = active requests that finished prefill.
         generating = []
@@ -5504,6 +6100,40 @@ def _build_active_models_data() -> dict:
                     "max_tokens": getattr(req, "max_tokens", None) if req else None,
                 }
             )
+
+        if cluster_metrics is not None:
+            # Synthesize scheduler-shaped prefill/generate rows from rank
+            # zero's most recent request sample so the existing sub-row
+            # rendering applies unchanged.
+            last = cluster_metrics.get("last_request")
+            if isinstance(last, dict) and last.get("status") == "running":
+                progress = last.get("prefill_progress")
+                if isinstance(progress, dict) and progress.get("active"):
+                    prefilling.append(
+                        {
+                            "request_id": "rank0",
+                            "processed": progress.get("processed", 0),
+                            "total": progress.get("total", 0),
+                            "speed": progress.get("speed", 0.0),
+                            "eta": progress.get("eta"),
+                            "elapsed": progress.get("elapsed"),
+                            "detail": "cluster prefill",
+                        }
+                    )
+                elif last.get("decode_tps"):
+                    generating.append(
+                        {
+                            "request_id": "rank0",
+                            "elapsed_seconds": last.get("elapsed_seconds"),
+                            "generated_tokens": last.get("completion_tokens", 0),
+                            "tokens_per_second": last.get("decode_tps", 0.0),
+                            "last_activity_age_seconds": cluster_live.get(
+                                "age_seconds"
+                            ),
+                            "prompt_tokens": last.get("prompt_tokens", 0),
+                            "max_tokens": None,
+                        }
+                    )
 
         loading_started_at = model_info.get("loading_started_at")
         loading_elapsed_seconds = (
@@ -5606,6 +6236,11 @@ def _build_active_models_data() -> dict:
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
                 "dflash": dflash_info,
+                "cluster": (
+                    {**model_info["cluster"], "live": cluster_live}
+                    if model_info.get("cluster")
+                    else None
+                ),
             }
         )
 
@@ -5782,16 +6417,17 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
         )
         if cache_dir.exists():
             try:
-                for subdir in "0123456789abcdef":
-                    subdir_path = cache_dir / subdir
-                    if not subdir_path.exists():
-                        continue
-                    for f in subdir_path.glob("*.safetensors"):
-                        try:
-                            f.unlink()
-                            total_deleted += 1
-                        except OSError:
-                            pass
+                for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
+                    for subdir in "0123456789abcdef":
+                        subdir_path = root / subdir
+                        if not subdir_path.exists():
+                            continue
+                        for f in subdir_path.glob("*.safetensors"):
+                            try:
+                                f.unlink()
+                                total_deleted += 1
+                            except OSError:
+                                pass
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
@@ -6989,7 +7625,7 @@ async def start_ane_tuning(
     request: Request,
     is_admin: bool = Depends(require_admin),
 ):
-    """Tune the Qwen ANE/GPU split without changing persisted settings."""
+    """Tune the model’s ANE/GPU split without changing persisted settings."""
     from .accuracy_benchmark import get_queue_status
     from .ane_tuning import (
         ANETuningRequest,
@@ -7049,6 +7685,7 @@ async def start_ane_tuning(
             detail=f"Model {tuning_request.model_id} is not a supported language model",
         )
 
+    tuning_request.backend = "k2" if entry.config_model_type == "k2_horizon" else "qwen"
     cleanup_old_runs()
     run = create_run(tuning_request)
     run.task = asyncio.create_task(run_tuning(run, engine_pool))
@@ -7082,6 +7719,8 @@ async def cancel_ane_tuning(
         raise HTTPException(
             status_code=400, detail=f"ANE tuning is not running ({run.status})"
         )
+    if run.phase == "cleaning_up":
+        return {"status": "cleaning_up", "tuning_id": tuning_id}
     if run.task is not None and not run.task.done():
         run.task.cancel()
     return {"status": "cancelled", "tuning_id": tuning_id}

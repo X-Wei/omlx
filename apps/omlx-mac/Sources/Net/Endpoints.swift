@@ -14,6 +14,7 @@ enum AdminAPI {
     static let login           = "\(prefix)/login"
     static let globalSettings  = "\(prefix)/global-settings"
     static let serverInfo      = "\(prefix)/server-info"
+    static let usage           = "\(prefix)/usage"
     static let stats           = "\(prefix)/stats"
     static let statsClear      = "\(prefix)/stats/clear"
     static let statsClearAlltime = "\(prefix)/stats/clear-alltime"
@@ -33,6 +34,9 @@ enum AdminAPI {
     }
     static func applyModelProfile(_ id: String, _ name: String) -> String {
         "\(models)/\(id)/profiles/\(name)/apply"
+    }
+    static func applyModelTemplate(_ id: String, _ name: String) -> String {
+        "\(models)/\(id)/profile-templates/\(name)/apply"
     }
     static let profileTemplates = "\(prefix)/profile-templates"
     static func profileTemplate(_ name: String) -> String {
